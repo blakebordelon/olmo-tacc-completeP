@@ -201,6 +201,15 @@ class AttentionConfig(SequenceMixerConfig["SequenceMixer"]):
     dtype: DType = DType.float32
     sliding_window: Optional[SlidingWindowAttentionConfig] = None
     use_head_qk_norm: Optional[bool] = None
+    d_model_base: Optional[int] = None
+    """
+    For CompleteP (``init_method='complete_p'``) only. The ``d_model`` of the base reference model.
+    Stored on the built :class:`Attention` module and used to:
+
+    - Scale the ``w_out`` output by ``d_model_base / d_model`` in the forward pass.
+    - Scale the initialization std of all attention weight matrices by
+      ``sqrt(d_model / d_model_base)`` during weight init.
+    """
 
     def num_params(self, d_model: int) -> int:
         """
@@ -298,12 +307,14 @@ class AttentionConfig(SequenceMixerConfig["SequenceMixer"]):
                 return Attention(**kwargs)
             elif self.name == "fused":
                 kwargs.pop("use_flash", None)
+                kwargs.pop("d_model_base", None)
                 if "window_size" in kwargs:
                     raise OLMoConfigurationError(
                         "'window_size' is not supported with fused attention"
                     )
                 return FusedAttention(**kwargs)
             elif self.name == "normalized":
+                kwargs.pop("d_model_base", None)
                 if "window_size" in kwargs:
                     raise OLMoConfigurationError(
                         "'window_size' is not supported with normalized attention"
@@ -365,12 +376,16 @@ class Attention(SequenceMixer):
         init_device: str = "cpu",
         cache: Optional[BufferCache] = None,
         use_head_qk_norm: bool = False,
+        d_model_base: Optional[int] = None,
     ):
         super().__init__()
 
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads or n_heads
         self.d_model = d_model
+        self.d_model_base = d_model_base
+        # CompleteP output multiplier for w_out: d_model_base / d_model.
+        self.w_out_mult: float = d_model_base / d_model if d_model_base is not None else 1.0
         # Some models (e.g. Qwen3) use explicit head_dim that differs from d_model // n_heads.
         if head_dim is not None:
             self.head_dim = head_dim
@@ -466,6 +481,10 @@ class Attention(SequenceMixer):
                 f"Backend is set to {backend}, but GPUs are not available. Defaulting to torch."
             )
             backend = AttentionBackendName.torch
+
+        # CompleteP: override softmax scale to d_model_base / d_model instead of 1/sqrt(d_head).
+        if softmax_scale is None and d_model_base is not None:
+            softmax_scale = d_model_base / d_model
 
         backend.assert_supported()
         log.info(f"Using attention backend '{backend}'")
@@ -629,7 +648,10 @@ class Attention(SequenceMixer):
         att = att.view(B, T, -1)
 
         # shape: (batch_size, seq_len, d_model)
-        return self.w_out(att)
+        out = self.w_out(att)
+        if self.w_out_mult != 1.0:
+            out = self.w_out_mult * out
+        return out
 
     def apply_tp(
         self,
@@ -725,6 +747,12 @@ class Attention(SequenceMixer):
         else:
             if init_method == InitMethod.normalized:
                 std = d_model**-0.5
+            elif init_method == InitMethod.complete_p and self.d_model_base is not None:
+                # CompleteP: std = init_std * sqrt(d_model / d_model_base).
+                # This is paired with the explicit w_out_mult = d_model_base / d_model multiplier
+                # applied in the forward pass so that the effective output variance is
+                # width-independent.
+                std = std * math.sqrt(d_model / self.d_model_base)
             for w in (self.w_q, self.w_k, self.w_v):
                 init_linear(w, std=std, generator=generator)
 
@@ -745,6 +773,8 @@ class Attention(SequenceMixer):
             std = std / (2 * (block_idx + 1)) ** 0.5
         elif init_method == InitMethod.normalized:
             std = std / (2 * num_blocks) ** 0.5
+        # For complete_p: fan-in of w_out equals d_model (= n_heads * head_dim), same as Q/K/V,
+        # so the already-adjusted std is correct; no further change needed.
 
         init_linear(self.w_out, std=std, generator=generator)
 
@@ -1126,6 +1156,7 @@ class FusedAttention(SequenceMixer):
             std = std / (2 * (block_idx + 1)) ** 0.5
         elif init_method == InitMethod.normalized:
             std = std / (2 * num_blocks) ** 0.5
+        # For complete_p, FusedAttention does not store d_model_base, so std is unchanged.
 
         init_linear(self.w_out, std=std, generator=generator)
 

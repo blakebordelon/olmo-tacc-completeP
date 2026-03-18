@@ -1,3 +1,4 @@
+import math
 from typing import TYPE_CHECKING, Optional, Union, cast
 
 import torch
@@ -76,6 +77,28 @@ class InitMethod(StrEnum):
     specific dimensions, with no depth scaling.
     """
 
+    complete_p = "complete_p"
+    """
+    CompleteP (Complete Parametrization) initialization designed for Adam-type optimizers.
+
+    Each dense hidden weight (excluding the input embedding) is initialized with standard
+    deviation ``init_std * sqrt(d_in / d_base)`` where ``d_in`` is the fan-in of the weight
+    in the target model and ``d_base`` is the corresponding fan-in in the base reference model.
+    The readout (LM-head) weight uses a constant ``init_std`` with no width scaling.
+
+    These init stds are paired with explicit per-weight output multipliers ``d_base / d_in``
+    (implemented in :class:`~olmo_core.nn.feed_forward.CompletePFeedForward` and
+    :class:`~olmo_core.nn.transformer.block.CompletePReorderedNormTransformerBlock`) so that
+    the effective output variance is width-independent across model sizes.
+
+    Residual branches are additionally scaled by ``L_base / L`` (set via
+    ``attention_residual_alpha`` and ``feed_forward_residual_alpha`` in the block config).
+
+    Requires ``d_model_base`` to be stored on :class:`~olmo_core.nn.transformer.model.Transformer`
+    and passed through ``init_attention``; feed-forward base dimensions are read directly from
+    :class:`~olmo_core.nn.feed_forward.CompletePFeedForward` attributes.
+    """
+
     def init_embeddings(
         self,
         m: nn.Embedding,
@@ -94,6 +117,9 @@ class InitMethod(StrEnum):
             emb_std = 1.0 / embed_scale if embed_scale is not None else 1.0
             _apply_init(nn.init.normal_, m.weight, generator=generator, std=emb_std)
         else:
+            # Covers InitMethod.normal and InitMethod.complete_p.
+            # CompleteP does not scale embedding init; embeddings are excluded from the
+            # width-scaling rule.
             _apply_init(
                 nn.init.trunc_normal_,
                 m.weight,
@@ -119,6 +145,8 @@ class InitMethod(StrEnum):
             InitMethod.fan_in,
         ):
             std = d_model**-0.5
+        # For complete_p: readout uses constant std (no d_in scaling).
+        # The explicit d_model_base/d_model multiplier is applied in the forward pass.
         init_linear(m, std=std, generator=generator)
 
     def init_attention(
@@ -150,6 +178,19 @@ class InitMethod(StrEnum):
         std: float = 0.02,
         generator: Optional[torch.Generator] = None,
     ):
+        from ..feed_forward import CompletePFeedForward
+
+        if self == InitMethod.complete_p and isinstance(m, CompletePFeedForward):
+            # CompleteP: each weight is initialized with std = init_std * sqrt(d_in / d_base),
+            # paired with the explicit per-weight output multipliers in CompletePFeedForward.forward.
+            w1_std = std * math.sqrt(d_model / m.d_model_base)
+            w2_std = std * math.sqrt(m.hidden_size / m.hidden_size_base)
+            # w3 has the same fan-in as w1 (d_model → hidden_size)
+            init_linear(m.w1, std=w1_std, generator=generator)
+            init_linear(m.w3, std=w1_std, generator=generator)
+            init_linear(m.w2, std=w2_std, generator=generator)
+            return
+
         # Compute std for w1 initialization
         if self == InitMethod.fan_in:
             # For fan_in, w1 uses 1/√d_in where d_in = d_model (ignores base std parameter)

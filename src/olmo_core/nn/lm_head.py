@@ -90,6 +90,12 @@ class LMHeadConfig(ModuleConfig):
     bias: Optional[bool] = None
     dtype: DType = DType.float32
     loss_implementation: LMLossImplementation = LMLossImplementation.default
+    d_model_base: Optional[int] = None
+    """
+    For CompleteP (``init_method='complete_p'``) only. The ``d_model`` of the base reference model.
+    When set, the LM-head output (logits) is multiplied by ``d_model_base / d_model`` in the
+    forward pass to keep the effective readout scale width-independent.
+    """
 
     def num_params(self, d_model: int, vocab_size: int) -> int:
         """
@@ -131,6 +137,7 @@ class LMHeadConfig(ModuleConfig):
             if self.name == LMHeadType.default:
                 return LMHead(**kwargs)
             elif self.name == LMHeadType.normalized:
+                kwargs.pop("d_model_base", None)
                 return NormalizedLMHead(**kwargs)
             else:
                 raise NotImplementedError(self.name)
@@ -166,6 +173,7 @@ class LMHead(nn.Module):
         bias: bool = True,
         init_device: str = "cpu",
         loss_implementation: LMLossImplementation = LMLossImplementation.default,
+        d_model_base: Optional[int] = None,
     ):
         super().__init__()
         self.norm = (
@@ -177,6 +185,8 @@ class LMHead(nn.Module):
         self._loss_implementation = loss_implementation
         self._tp_mesh: Optional[DeviceMesh] = None
         self._cp_mesh: Optional[DeviceMesh] = None
+        # CompleteP readout multiplier: d_model_base / d_model, or 1.0 if not using CompleteP.
+        self.w_out_mult: float = d_model_base / d_model if d_model_base is not None else 1.0
 
     @property
     def d_model(self) -> int:
@@ -228,6 +238,12 @@ class LMHead(nn.Module):
         B = x.shape[0]
 
         h = self.norm(x) if self.norm is not None else x
+
+        # Apply CompleteP readout multiplier (d_model_base / d_model) to scale the logits.
+        # Multiplying h here is equivalent to multiplying the w_out output and is compatible
+        # with both default and fused-linear loss paths.
+        if self.w_out_mult != 1.0:
+            h = self.w_out_mult * h
 
         if isinstance(logits_to_keep, int):
             if logits_to_keep != 0:

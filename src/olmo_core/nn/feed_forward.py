@@ -23,6 +23,7 @@ __all__ = [
     "FeedForwardConfig",
     "FeedForward",
     "NormalizedFeedForward",
+    "CompletePFeedForward",
 ]
 
 
@@ -65,6 +66,15 @@ class FeedForwardType(StrEnum):
     ➡️ :class:`NormalizedFeedForward`
     """
 
+    complete_p = "complete_p"
+    """
+    ➡️ :class:`CompletePFeedForward`
+
+    CompleteP (Complete Parametrization) variant. Each weight matrix output is scaled by
+    ``d_model_base / d_in`` where ``d_in`` is the fan-in of that weight in the target model and
+    ``d_model_base`` / ``hidden_size_base`` are the corresponding fan-ins in the base model.
+    """
+
 
 @dataclass
 class FeedForwardConfig(ModuleConfig):
@@ -82,6 +92,16 @@ class FeedForwardConfig(ModuleConfig):
     activation: ActivationFunction = ActivationFunction.silu
     """
     The activation function to use. See :class:`ActivationFunction` for options.
+    """
+    d_model_base: Optional[int] = None
+    """
+    For :data:`FeedForwardType.complete_p` only. The ``d_model`` of the base reference model,
+    used to compute the ``w1``/``w3`` output multiplier ``d_model_base / d_model``.
+    """
+    hidden_size_base: Optional[int] = None
+    """
+    For :data:`FeedForwardType.complete_p` only. The ``hidden_size`` of the base reference model,
+    used to compute the ``w2`` output multiplier ``hidden_size_base / hidden_size``.
     """
 
     def num_params(self, d_model: int) -> int:
@@ -123,14 +143,26 @@ class FeedForwardConfig(ModuleConfig):
 
         try:
             if self.name == FeedForwardType.default:
+                # d_model_base/hidden_size_base are only for complete_p; exclude them.
+                kwargs.pop("d_model_base", None)
+                kwargs.pop("hidden_size_base", None)
                 return FeedForward(**kwargs)
             elif self.name == FeedForwardType.normalized:
+                kwargs.pop("d_model_base", None)
+                kwargs.pop("hidden_size_base", None)
                 activation = kwargs.get("activation", ActivationFunction.silu)
                 if activation != ActivationFunction.silu:
                     raise OLMoConfigurationError(
                         f"NormalizedFeedForward only supports 'silu' activation, got '{activation}'"
                     )
                 return NormalizedFeedForward(**kwargs)
+            elif self.name == FeedForwardType.complete_p:
+                if self.d_model_base is None or self.hidden_size_base is None:
+                    raise OLMoConfigurationError(
+                        "FeedForwardConfig with name='complete_p' requires "
+                        "'d_model_base' and 'hidden_size_base' to be set."
+                    )
+                return CompletePFeedForward(**kwargs)
             else:
                 raise NotImplementedError(self.name)
         except TypeError as e:
@@ -281,3 +313,60 @@ class NormalizedFeedForward(FeedForward):
 
     def _normalize_matrix(self, w: torch.Tensor, dim: int = -1):
         w.copy_(l2_normalize(w, dim=dim))
+
+
+class CompletePFeedForward(FeedForward):
+    """
+    A CompleteP (Complete Parametrization) feed-forward module for use with Adam-type optimizers.
+
+    Each weight matrix output is scaled by an explicit multiplier ``d_base / d_in``, where
+    ``d_in`` is the fan-in of that weight in the target (scaled) model and ``d_base`` is the
+    corresponding fan-in in the base reference model:
+
+    - ``w1`` (d_model → hidden_size): multiplied by ``d_model_base / d_model``
+    - ``w3`` (d_model → hidden_size): multiplied by ``d_model_base / d_model``
+    - ``w2`` (hidden_size → d_model): multiplied by ``hidden_size_base / hidden_size``
+
+    These multipliers ensure that the effective output variance is width-independent, enabling
+    faithful hyperparameter transfer across model sizes when using Adam.
+
+    :param d_model_base: Fan-in of ``w1``/``w3`` in the base reference model.
+    :param hidden_size_base: Fan-in of ``w2`` in the base reference model.
+    """
+
+    def __init__(
+        self,
+        *,
+        d_model: int,
+        hidden_size: int,
+        d_model_base: int,
+        hidden_size_base: int,
+        bias: bool = True,
+        dtype: torch.dtype = torch.float32,
+        init_device: str = "cpu",
+        activation: ActivationFunction = ActivationFunction.silu,
+    ):
+        super().__init__(
+            d_model=d_model,
+            hidden_size=hidden_size,
+            bias=bias,
+            dtype=dtype,
+            init_device=init_device,
+            activation=activation,
+        )
+        self.d_model_base = d_model_base
+        self.hidden_size_base = hidden_size_base
+        # Explicit per-weight output multipliers: d_base / d_in.
+        self.w1_mult: float = d_model_base / d_model
+        self.w3_mult: float = d_model_base / d_model
+        self.w2_mult: float = hidden_size_base / hidden_size
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Run the CompleteP feed-forward on the input ``x``.
+
+        :param x: The input of shape ``(*, d_model)``.
+        """
+        return self.w2_mult * self.w2(
+            self.activation_fn(self.w1_mult * self.w1(x)) * (self.w3_mult * self.w3(x))
+        )
