@@ -89,13 +89,13 @@ N_HEADS  = MODEL_SIZES[MODEL_SIZE]["n_heads"]
 # N_LAYERS_BASE every multiplier is 1.0 and training is identical to standard.
 #
 # What CompleteP changes at (D_MODEL, N_LAYERS) ≠ (D_MODEL_BASE, N_LAYERS_BASE):
-#   - Attention softmax scale:    d_model_base / d_model  (replaces 1/sqrt(d_head))
+#   - Attention softmax scale:    sqrt(d_head_base) / d_head  (equals 1/sqrt(d_head_base) at base size)
 #   - Attention w_out multiplier: d_model_base / d_model
 #   - FFN w1/w3 multiplier:       d_model_base / d_model
 #   - FFN w2   multiplier:        hidden_size_base / hidden_size
 #   - Residual update (depth):    x = x + (n_layers_base / n_layers) * BLOCK(x)
 #   - All weight init stds:       std * sqrt(d_model / d_model_base)
-COMPLETE_P = False  # ← set True to use CompleteP
+COMPLETE_P = True  # ← set True to use CompleteP
 D_MODEL_BASE  = MODEL_SIZES["190M"]["d_model"]   # 768  — reference width
 N_LAYERS_BASE = MODEL_SIZES["190M"]["n_layers"]  # 12   — reference depth
 
@@ -207,6 +207,11 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
             d_model_base=D_MODEL_BASE,
             hidden_size_base=HIDDEN_SIZE_BASE,
         )
+        # LM head: apply d_model_base / d_model multiplier to logits. This keeps the effective
+        # readout scale width-independent and implicitly scales the Adam LR on the readout weight
+        # by d_model_base / d_model, matching the muP prescription. Init std is left at the
+        # constant init_std (no width scaling) per the CompleteP readout rule.
+        model_config.lm_head.d_model_base = D_MODEL_BASE  # type: ignore[union-attr]
         # Depth scaling: residual update becomes x = x + (n_layers_base / n_layers) * BLOCK(x).
         # This is implemented via the existing residual_alpha fields on TransformerBlockConfig,
         # which feed into ResidualStream.forward: torch.add(residual, block_out, alpha=alpha).

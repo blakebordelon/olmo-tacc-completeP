@@ -207,6 +207,9 @@ class AttentionConfig(SequenceMixerConfig["SequenceMixer"]):
     Stored on the built :class:`Attention` module and used to:
 
     - Scale the ``w_out`` output by ``d_model_base / d_model`` in the forward pass.
+    - Override the softmax scale to ``sqrt(d_head_base) / d_head`` where
+      ``d_head_base = d_model_base / n_heads``. At the base model size this equals
+      ``1/sqrt(d_head_base)``, exactly matching the standard ``1/sqrt(d_head)`` convention.
     - Scale the initialization std of all attention weight matrices by
       ``sqrt(d_model / d_model_base)`` during weight init.
     """
@@ -482,9 +485,13 @@ class Attention(SequenceMixer):
             )
             backend = AttentionBackendName.torch
 
-        # CompleteP: override softmax scale to d_model_base / d_model instead of 1/sqrt(d_head).
+        # CompleteP: override softmax scale to sqrt(d_head_base) / d_head, where
+        # d_head_base = d_model_base / n_heads. At d_model == d_model_base this
+        # reduces to 1/sqrt(d_head_base), exactly matching the standard 1/sqrt(d_head)
+        # scale of the base model.
         if softmax_scale is None and d_model_base is not None:
-            softmax_scale = d_model_base / d_model
+            d_head_base = d_model_base / n_heads
+            softmax_scale = math.sqrt(d_head_base) / self.head_dim
 
         backend.assert_supported()
         log.info(f"Using attention backend '{backend}'")
