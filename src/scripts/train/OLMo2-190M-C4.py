@@ -35,6 +35,7 @@ from olmo_core.data import (
     TokenizerConfig,
 )
 from olmo_core.distributed.parallel import DataParallelType
+from olmo_core.nn.attention import AttentionBackendName
 from olmo_core.nn.feed_forward import FeedForwardConfig, FeedForwardType
 from olmo_core.nn.transformer import TransformerConfig
 from olmo_core.nn.transformer.init import InitMethod
@@ -110,15 +111,16 @@ HIDDEN_SIZE_BASE = _hidden_size_base(D_MODEL_BASE)
 # ───────────────────────────────────────────────────────────────────────────────
 
 SEQUENCE_LENGTH = 1024
-GLOBAL_BATCH_SIZE = 504 * SEQUENCE_LENGTH  # ~516K tokens/step (divisible by micro_batch=4*1024 x 3 GPUs)
-LR = 3e-4
-TOTAL_TOKENS = int(1e11)  # 100B tokens
+GLOBAL_BATCH_SIZE = 512 * SEQUENCE_LENGTH  # ~524K tokens/step (divisible by rank_microbatch=64*1024 with any DP world size)
+LR = 1e-3
+TOTAL_TOKENS = int(4e9)  # 4B tokens
 
 TRAIN_DATA_PATHS = [
-    "/scratch/11423/blakebordelon/ICL_proj/datasets/olmo/c4-train.00000-00099.npy"
+    "/scratch/11423/blakebordelon/ICL_proj/datasets/olmo/part-000-00000.npy",
+    "/scratch/11423/blakebordelon/ICL_proj/datasets/olmo/part-001-00000.npy",
 ]
 VAL_DATA_PATHS = [
-    "/scratch/11423/blakebordelon/ICL_proj/datasets/olmo/c4-validation.00000-00008.npy"
+    "/scratch/11423/blakebordelon/ICL_proj/datasets/olmo/part-0-00000.npy"
 ]
 
 
@@ -176,7 +178,7 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
     save_folder = f"{opts.save_folder}/{run_name}"
 
     sequence_length = opts.sequence_length or SEQUENCE_LENGTH
-    tokenizer_config = TokenizerConfig.gpt2()
+    tokenizer_config = TokenizerConfig.gpt_neox_olmo_dolma_v1_5()
 
     model_config = TransformerConfig.llama_like(
         d_model=d_model,
@@ -187,6 +189,7 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
         qk_norm=True,
         rope_theta=500_000,
         layer_norm_eps=1e-6,
+        attn_backend=AttentionBackendName.flash_2,
     )
 
     if COMPLETE_P:
@@ -233,7 +236,7 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
     )
 
     train_module_config = TransformerTrainModuleConfig(
-        rank_microbatch_size=4 * sequence_length,
+        rank_microbatch_size=64 * sequence_length,
         max_sequence_length=sequence_length,
         optim=SkipStepAdamWConfig(
             lr=lr,
@@ -248,7 +251,7 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
         dp_config=TransformerDataParallelConfig(
             name=DataParallelType.hsdp,
             param_dtype=DType.bfloat16,
-            reduce_dtype=DType.float32,
+            reduce_dtype=DType.bfloat16,
             wrapping_strategy=TransformerDataParallelWrappingStrategy.blocks,
         ),
         z_loss_multiplier=1e-5,

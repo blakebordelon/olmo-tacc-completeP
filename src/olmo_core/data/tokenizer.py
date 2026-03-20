@@ -124,6 +124,18 @@ class TokenizerConfig(Config):
         )
 
     @classmethod
+    def gpt_neox_20b(cls) -> "TokenizerConfig":
+        """
+        Get a tokenizer config for ``EleutherAI/gpt-neox-20b``.
+        """
+        return cls(
+            vocab_size=50432,
+            eos_token_id=0,
+            pad_token_id=0,
+            identifier="EleutherAI/gpt-neox-20b",
+        )
+
+    @classmethod
     def from_hf(cls, identifier: str) -> "TokenizerConfig":
         """
         Initialize a tokenizer config from a model on HuggingFace.
@@ -134,13 +146,17 @@ class TokenizerConfig(Config):
 
         from cached_path import cached_path
 
-        try:
-            config_path = cached_path(f"hf://{identifier}/config.json")
-        except FileNotFoundError:
-            config_path = cached_path(f"hf://{identifier}/tokenizer_config.json")
-
-        with config_path.open() as f:
-            config = json.load(f)
+        config = None
+        for filename in ("config.json", "tokenizer_config.json"):
+            try:
+                config_path = cached_path(f"hf://{identifier}/{filename}")
+                with config_path.open() as f:
+                    config = json.load(f)
+                break
+            except (FileNotFoundError, json.JSONDecodeError):
+                continue
+        if config is None:
+            raise FileNotFoundError(f"Could not find a valid config.json or tokenizer_config.json for '{identifier}'")
 
         return cls(
             vocab_size=config["vocab_size"],
