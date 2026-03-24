@@ -70,6 +70,18 @@ class WandBCallback(Callback):
     The config to load to W&B.
     """
 
+    run_id: Optional[str] = None
+    """
+    A specific W&B run ID to use. If set alongside ``resume="must"`` or ``resume="allow"``,
+    this will resume or overwrite an existing run with that ID.
+    """
+
+    resume: Optional[str] = None
+    """
+    W&B resume behavior. One of ``"allow"``, ``"must"``, ``"never"``, or ``"auto"``.
+    Set to ``"allow"`` with ``run_id`` to overwrite/resume a specific existing run.
+    """
+
     cancel_tags: Optional[List[str]] = field(
         default_factory=lambda: ["cancel", "canceled", "cancelled"]
     )
@@ -131,6 +143,8 @@ class WandBCallback(Callback):
                 entity=self.entity,
                 group=self.group,
                 name=self.name,
+                id=self.run_id,
+                resume=self.resume,
                 tags=self.tags,
                 notes=self.notes,
                 config=self.config,
