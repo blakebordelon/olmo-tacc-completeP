@@ -39,7 +39,13 @@ from olmo_core.nn.attention import AttentionBackendName
 from olmo_core.nn.feed_forward import FeedForwardConfig, FeedForwardType
 from olmo_core.nn.transformer import TransformerConfig
 from olmo_core.nn.transformer.init import InitMethod
-from olmo_core.optim import CosWithWarmup, OptimGroupOverride, SkipStepAdamWConfig
+from olmo_core.optim import (
+    ConstantWithWarmup,
+    CosWithWarmup,
+    LinearWithWarmup,
+    OptimGroupOverride,
+    SkipStepAdamWConfig,
+)
 from olmo_core.script_utils import ExperimentConfig, get_cli_parser, main
 from olmo_core.train import Duration, TrainerConfig
 from olmo_core.train.callbacks import (
@@ -133,6 +139,13 @@ def _make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lr", type=float, default=None, help="Peak learning rate (overrides LR default).")
     parser.add_argument("--total-tokens", type=float, default=None, help="Total training tokens, e.g. 1e11 (overrides TOTAL_TOKENS default).")
     parser.add_argument("--global-batch-size", type=int, default=None, help="Global batch size in tokens (overrides GLOBAL_BATCH_SIZE default).")
+    parser.add_argument(
+        "--schedule",
+        type=str,
+        default="cosine",
+        choices=["cosine", "constant", "polynomial"],
+        help="Learning rate schedule: 'cosine' (default, CosWithWarmup), 'constant' (ConstantWithWarmup), or 'polynomial' (LinearWithWarmup).",
+    )
     return parser
 
 
@@ -160,8 +173,19 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
     lr           = opts.lr            or LR
     total_tokens = int(opts.total_tokens or TOTAL_TOKENS)
     batch_size   = opts.global_batch_size or GLOBAL_BATCH_SIZE
+    schedule     = opts.schedule  # "cosine" | "constant" | "polynomial"
 
     head_dim = d_model // n_heads
+
+    # ── Build scheduler ──────────────────────────────────────────────────────────
+    if schedule == "cosine":
+        scheduler = CosWithWarmup(warmup_steps=2000)
+    elif schedule == "constant":
+        scheduler = ConstantWithWarmup(warmup=2000)
+    elif schedule == "polynomial":
+        scheduler = LinearWithWarmup(warmup=2000)
+    else:
+        raise ValueError(f"Unknown schedule: {schedule!r}")
 
     # ── Auto-generate run name from hyperparams ──────────────────────────────────
     optim_tag = "skip_adamw"
@@ -173,6 +197,8 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
     )
     if COMPLETE_P:
         run_name += "_completep"
+    if schedule != "cosine":
+        run_name += f"_{schedule}"
     # opts.name overrides the auto-generated name (useful for one-off runs)
     run_name = opts.name or run_name
     save_folder = f"{opts.save_folder}/{run_name}"
@@ -236,7 +262,7 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
     )
 
     train_module_config = TransformerTrainModuleConfig(
-        rank_microbatch_size=64 * sequence_length,
+        rank_microbatch_size=32 * sequence_length,
         max_sequence_length=sequence_length,
         optim=SkipStepAdamWConfig(
             lr=lr,
@@ -246,7 +272,7 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
                 OptimGroupOverride(params=["embeddings.weight"], opts=dict(weight_decay=0.0))
             ],
         ),
-        scheduler=CosWithWarmup(warmup_steps=2000),
+        scheduler=scheduler,
         compile_model=True,
         dp_config=TransformerDataParallelConfig(
             name=DataParallelType.hsdp,
