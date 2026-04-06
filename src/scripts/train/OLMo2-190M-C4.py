@@ -45,6 +45,7 @@ from olmo_core.optim import (
     LinearWithWarmup,
     OptimGroupOverride,
     SkipStepAdamWConfig,
+    WSD,
 )
 from olmo_core.script_utils import ExperimentConfig, get_cli_parser, main
 from olmo_core.train import Duration, TrainerConfig
@@ -117,13 +118,17 @@ HIDDEN_SIZE_BASE = _hidden_size_base(D_MODEL_BASE)
 # ───────────────────────────────────────────────────────────────────────────────
 
 SEQUENCE_LENGTH = 1024
-GLOBAL_BATCH_SIZE = 512 * SEQUENCE_LENGTH  # ~524K tokens/step (divisible by rank_microbatch=64*1024 with any DP world size)
+GLOBAL_BATCH_SIZE = 576 * SEQUENCE_LENGTH  # ~524K tokens/step (divisible by rank_microbatch=64*1024 with any DP world size)
 LR = 1e-3
 TOTAL_TOKENS = int(4e9)  # 4B tokens
 
 TRAIN_DATA_PATHS = [
     "/scratch/11423/blakebordelon/ICL_proj/datasets/olmo/part-000-00000.npy",
     "/scratch/11423/blakebordelon/ICL_proj/datasets/olmo/part-001-00000.npy",
+    "/scratch/11423/blakebordelon/ICL_proj/datasets/olmo/part-002-00000.npy",
+    "/scratch/11423/blakebordelon/ICL_proj/datasets/olmo/part-003-00000.npy",
+    "/scratch/11423/blakebordelon/ICL_proj/datasets/olmo/part-004-00000.npy",
+    "/scratch/11423/blakebordelon/ICL_proj/datasets/olmo/part-005-00000.npy",    
 ]
 VAL_DATA_PATHS = [
     "/scratch/11423/blakebordelon/ICL_proj/datasets/olmo/part-0-00000.npy"
@@ -143,8 +148,14 @@ def _make_parser() -> argparse.ArgumentParser:
         "--schedule",
         type=str,
         default="cosine",
-        choices=["cosine", "constant", "polynomial"],
-        help="Learning rate schedule: 'cosine' (default, CosWithWarmup), 'constant' (ConstantWithWarmup), or 'polynomial' (LinearWithWarmup).",
+        choices=["cosine", "constant", "polynomial", "wsd"],
+        help="Learning rate schedule: 'cosine' (default, CosWithWarmup), 'constant' (ConstantWithWarmup), 'polynomial' (LinearWithWarmup), or 'wsd' (WSD warmup-stable-decay, 10%% annealing by default).",
+    )
+    parser.add_argument(
+        "--wsd-decay-fraction",
+        type=float,
+        default=0.1,
+        help="Fraction of total steps used for linear decay in the WSD schedule (default: 0.1).",
     )
     return parser
 
@@ -173,7 +184,8 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
     lr           = opts.lr            or LR
     total_tokens = int(opts.total_tokens or TOTAL_TOKENS)
     batch_size   = opts.global_batch_size or GLOBAL_BATCH_SIZE
-    schedule     = opts.schedule  # "cosine" | "constant" | "polynomial"
+    schedule          = opts.schedule  # "cosine" | "constant" | "polynomial" | "wsd"
+    wsd_decay_fraction = opts.wsd_decay_fraction
 
     head_dim = d_model // n_heads
 
@@ -184,6 +196,8 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
         scheduler = ConstantWithWarmup(warmup=2000)
     elif schedule == "polynomial":
         scheduler = LinearWithWarmup(warmup=2000)
+    elif schedule == "wsd":
+        scheduler = WSD(warmup=2000, decay_fraction=wsd_decay_fraction)
     else:
         raise ValueError(f"Unknown schedule: {schedule!r}")
 
@@ -197,7 +211,9 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
     )
     if COMPLETE_P:
         run_name += "_completep"
-    if schedule != "cosine":
+    if schedule == "wsd":
+        run_name += f"_wsd{int(wsd_decay_fraction * 100)}pct"
+    elif schedule != "cosine":
         run_name += f"_{schedule}"
     # opts.name overrides the auto-generated name (useful for one-off runs)
     run_name = opts.name or run_name
