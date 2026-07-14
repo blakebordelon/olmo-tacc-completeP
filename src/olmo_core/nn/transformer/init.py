@@ -99,6 +99,37 @@ class InitMethod(StrEnum):
     :class:`~olmo_core.nn.feed_forward.CompletePFeedForward` attributes.
     """
 
+    complete_p_sde = "complete_p_sde"
+    """
+    Like :data:`complete_p`, but every hidden weight -- including the residual-writing
+    "down" projections ``w2`` (feed-forward) and ``w_out`` (attention) -- is initialized with
+    ``std = init_std * sqrt(d_model / d_model_base)``, i.e. the *residual* width sets the init
+    scale for all of them rather than each weight's own fan-in.
+
+    Multipliers are unchanged from :data:`complete_p`: ``d_base / d_in`` per weight, times
+    ``L_base / L`` on the residual branches. So the down projections have an effective map of
+    ``(1 / (L * M)) W`` with ``W_ij ~ O(sqrt(N))``, where ``N = d_model``, ``L = n_layers``, and
+    ``M`` is the block hidden width (``hidden_size`` for the MLP, ``n_heads`` for attention).
+
+    Because the coherent (Adam-driven) response of a layer grows like its fan-in while the
+    incoherent (init) response grows like the square root of its fan-in, this opens a gap between
+    the two: at init each block writes ``Theta(sqrt(alpha / L))`` into the residual stream while
+    each Adam step moves it by ``Theta(eta / L)``. Summed over ``L`` blocks -- diffusively for the
+    former, coherently for the latter -- both are ``Theta(1)`` with a learning rate that is
+    constant in ``N``, ``M`` and ``L``. The residual stream then has a joint SDE limit with
+    diffusion coefficients
+
+    - ``alpha_mlp = d_model / (hidden_size * n_layers)``
+    - ``alpha_att = d_model / (n_heads * n_layers)``
+
+    .. important::
+        This only has any effect on a block whose residual branch output is *not* normalized,
+        i.e. :data:`~olmo_core.nn.transformer.block.TransformerBlockType.default` (pre-norm).
+        RMSNorm is 0-homogeneous, so the branch-output norm in ``reordered_norm`` / ``peri_norm``
+        cancels the init std of the down projections exactly and this init method degenerates
+        back to :data:`complete_p`.
+    """
+
     def init_embeddings(
         self,
         m: nn.Embedding,
@@ -117,7 +148,7 @@ class InitMethod(StrEnum):
             emb_std = 1.0 / embed_scale if embed_scale is not None else 1.0
             _apply_init(nn.init.normal_, m.weight, generator=generator, std=emb_std)
         else:
-            # Covers InitMethod.normal and InitMethod.complete_p.
+            # Covers InitMethod.normal, InitMethod.complete_p and InitMethod.complete_p_sde.
             # CompleteP does not scale embedding init; embeddings are excluded from the
             # width-scaling rule.
             _apply_init(
@@ -180,11 +211,21 @@ class InitMethod(StrEnum):
     ):
         from ..feed_forward import CompletePFeedForward
 
-        if self == InitMethod.complete_p and isinstance(m, CompletePFeedForward):
+        if self in (InitMethod.complete_p, InitMethod.complete_p_sde) and isinstance(
+            m, CompletePFeedForward
+        ):
             # CompleteP: each weight is initialized with std = init_std * sqrt(d_in / d_base),
             # paired with the explicit per-weight output multipliers in CompletePFeedForward.forward.
             w1_std = std * math.sqrt(d_model / m.d_model_base)
-            w2_std = std * math.sqrt(m.hidden_size / m.hidden_size_base)
+            if self == InitMethod.complete_p_sde:
+                # SDE variant: the down projection is initialized off the *residual* width rather
+                # than its own fan-in, so all three weights share the same std. Paired with the
+                # unchanged w2 multiplier (hidden_size_base / hidden_size, times L_base / L on the
+                # residual branch) this makes the block's init contribution to the residual stream
+                # diffusive, O(1/sqrt(L)), while its Adam-driven contribution stays O(1/L).
+                w2_std = w1_std
+            else:
+                w2_std = std * math.sqrt(m.hidden_size / m.hidden_size_base)
             # w3 has the same fan-in as w1 (d_model → hidden_size)
             init_linear(m.w1, std=w1_std, generator=generator)
             init_linear(m.w3, std=w1_std, generator=generator)

@@ -21,10 +21,12 @@ from .config import (
 )
 from .init import InitMethod
 from .model import MoETransformer, NormalizedTransformer, Transformer
+from .scaling import JointScalingConfig
 
 __all__ = [
     "TransformerType",
     "TransformerConfig",
+    "JointScalingConfig",
     "Transformer",
     "NormalizedTransformer",
     "MoETransformer",

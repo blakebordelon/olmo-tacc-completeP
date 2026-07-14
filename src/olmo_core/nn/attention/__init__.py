@@ -213,6 +213,33 @@ class AttentionConfig(SequenceMixerConfig["SequenceMixer"]):
     - Scale the initialization std of all attention weight matrices by
       ``sqrt(d_model / d_model_base)`` during weight init.
     """
+    n_heads_base: Optional[int] = None
+    """
+    For CompleteP only. The ``n_heads`` of the base reference model. Set this (together with
+    ``head_dim``) when scaling the head count independently of ``d_model``, so that the fan-in of
+    ``w_out`` is ``n_heads * head_dim`` rather than ``d_model``. When set, the ``w_out``
+    multiplier becomes ``(n_heads_base * head_dim_base) / (n_heads * head_dim)``.
+
+    When left unset the fan-in of ``w_out`` is assumed to be ``d_model`` (the usual case where
+    ``head_dim = d_model // n_heads``) and the legacy ``d_model_base / d_model`` multiplier is used.
+    """
+    head_dim_base: Optional[int] = None
+    """
+    For CompleteP only. The ``head_dim`` of the base reference model. Defaults to ``head_dim``,
+    which is the right choice when scaling the head *count* at fixed head dimension. Also sets the
+    softmax scale to ``sqrt(head_dim_base) / head_dim`` (constant when ``head_dim`` is held fixed).
+    """
+    apply_qkv_mult: bool = False
+    """
+    For CompleteP only. Apply the ``d_model_base / d_model`` multiplier to the Q/K/V projections
+    in the forward pass, so that the value stream (and hence the attention output before ``w_out``)
+    stays ``O(1)`` as ``d_model`` grows.
+
+    This is required by :data:`~olmo_core.nn.transformer.init.InitMethod.complete_p_sde` on a
+    pre-norm block. It defaults to ``False`` because it is a no-op under the ``reordered_norm``
+    block (the branch-output RMSNorm cancels it) and leaving it off keeps existing ``complete_p``
+    runs bit-identical.
+    """
 
     def num_params(self, d_model: int) -> int:
         """
@@ -311,6 +338,9 @@ class AttentionConfig(SequenceMixerConfig["SequenceMixer"]):
             elif self.name == "fused":
                 kwargs.pop("use_flash", None)
                 kwargs.pop("d_model_base", None)
+                kwargs.pop("n_heads_base", None)
+                kwargs.pop("head_dim_base", None)
+                kwargs.pop("apply_qkv_mult", None)
                 if "window_size" in kwargs:
                     raise OLMoConfigurationError(
                         "'window_size' is not supported with fused attention"
@@ -318,6 +348,9 @@ class AttentionConfig(SequenceMixerConfig["SequenceMixer"]):
                 return FusedAttention(**kwargs)
             elif self.name == "normalized":
                 kwargs.pop("d_model_base", None)
+                kwargs.pop("n_heads_base", None)
+                kwargs.pop("head_dim_base", None)
+                kwargs.pop("apply_qkv_mult", None)
                 if "window_size" in kwargs:
                     raise OLMoConfigurationError(
                         "'window_size' is not supported with normalized attention"
@@ -380,6 +413,9 @@ class Attention(SequenceMixer):
         cache: Optional[BufferCache] = None,
         use_head_qk_norm: bool = False,
         d_model_base: Optional[int] = None,
+        n_heads_base: Optional[int] = None,
+        head_dim_base: Optional[int] = None,
+        apply_qkv_mult: bool = False,
     ):
         super().__init__()
 
@@ -387,13 +423,30 @@ class Attention(SequenceMixer):
         self.n_kv_heads = n_kv_heads or n_heads
         self.d_model = d_model
         self.d_model_base = d_model_base
-        # CompleteP output multiplier for w_out: d_model_base / d_model.
-        self.w_out_mult: float = d_model_base / d_model if d_model_base is not None else 1.0
         # Some models (e.g. Qwen3) use explicit head_dim that differs from d_model // n_heads.
         if head_dim is not None:
             self.head_dim = head_dim
         else:
             self.head_dim = d_model // n_heads
+
+        self.n_heads_base = n_heads_base
+        self.head_dim_base = head_dim_base if head_dim_base is not None else self.head_dim
+
+        # CompleteP multipliers, both of the form (base fan-in) / (fan-in).
+        #
+        #   Q/K/V: fan-in is d_model.
+        #   w_out: fan-in is n_heads * head_dim. When the head count is not being scaled
+        #          independently of d_model (n_heads_base unset) this equals d_model, which
+        #          recovers the legacy d_model_base / d_model multiplier.
+        self.qkv_mult: float = (
+            d_model_base / d_model if (apply_qkv_mult and d_model_base is not None) else 1.0
+        )
+        if d_model_base is None:
+            self.w_out_mult: float = 1.0
+        elif n_heads_base is not None:
+            self.w_out_mult = (n_heads_base * self.head_dim_base) / (n_heads * self.head_dim)
+        else:
+            self.w_out_mult = d_model_base / d_model
         self.w_q = nn.Linear(
             d_model, n_heads * self.head_dim, bias=bias, dtype=dtype, device=init_device
         )
@@ -485,12 +538,16 @@ class Attention(SequenceMixer):
             )
             backend = AttentionBackendName.torch
 
-        # CompleteP: override softmax scale to sqrt(d_head_base) / d_head, where
-        # d_head_base = d_model_base / n_heads. At d_model == d_model_base this
-        # reduces to 1/sqrt(d_head_base), exactly matching the standard 1/sqrt(d_head)
-        # scale of the base model.
+        # CompleteP: override softmax scale to sqrt(d_head_base) / d_head. At the base model size
+        # this reduces to 1/sqrt(d_head_base), exactly matching the standard 1/sqrt(d_head) scale.
+        #
+        # When the head count is being scaled independently of d_model, d_head_base must come from
+        # head_dim_base -- deriving it as d_model_base / n_heads would make the softmax scale drift
+        # with n_heads even though head_dim is held fixed.
         if softmax_scale is None and d_model_base is not None:
-            d_head_base = d_model_base / n_heads
+            d_head_base: float = (
+                self.head_dim_base if n_heads_base is not None else d_model_base / n_heads
+            )
             softmax_scale = math.sqrt(d_head_base) / self.head_dim
 
         backend.assert_supported()
@@ -576,6 +633,12 @@ class Attention(SequenceMixer):
         #        (batch_size, seq_len, n_kv_heads * head_dim),
         #        (batch_size, seq_len, n_kv_heads * head_dim)
         q, k, v = self.w_q(x), self.w_k(x), self.w_v(x)
+
+        if self.qkv_mult != 1.0:
+            # CompleteP: d_model_base / d_model. On q/k this is absorbed by QK-norm (when enabled)
+            # and by the softmax scale; it is the value stream that actually needs it, to stay O(1)
+            # as d_model grows.
+            q, k, v = self.qkv_mult * q, self.qkv_mult * k, self.qkv_mult * v
 
         if self.clip_qkv is not None:
             q.clamp_(min=-self.clip_qkv, max=self.clip_qkv)
@@ -754,7 +817,10 @@ class Attention(SequenceMixer):
         else:
             if init_method == InitMethod.normalized:
                 std = d_model**-0.5
-            elif init_method == InitMethod.complete_p and self.d_model_base is not None:
+            elif (
+                init_method in (InitMethod.complete_p, InitMethod.complete_p_sde)
+                and self.d_model_base is not None
+            ):
                 # CompleteP: std = init_std * sqrt(d_model / d_model_base).
                 # This is paired with the explicit w_out_mult = d_model_base / d_model multiplier
                 # applied in the forward pass so that the effective output variance is
@@ -780,8 +846,23 @@ class Attention(SequenceMixer):
             std = std / (2 * (block_idx + 1)) ** 0.5
         elif init_method == InitMethod.normalized:
             std = std / (2 * num_blocks) ** 0.5
-        # For complete_p: fan-in of w_out equals d_model (= n_heads * head_dim), same as Q/K/V,
-        # so the already-adjusted std is correct; no further change needed.
+        elif (
+            init_method == InitMethod.complete_p
+            and self.d_model_base is not None
+            and self.n_heads_base is not None
+        ):
+            # CompleteP inits each weight off its own fan-in. When the head count is scaled
+            # independently of d_model the fan-in of w_out is n_heads * head_dim, not d_model, so
+            # rescale from the Q/K/V std (which used d_model) to the w_out fan-in.
+            fan_in = self.n_heads * self.head_dim
+            fan_in_base = self.n_heads_base * self.head_dim_base
+            std = std * math.sqrt((fan_in / fan_in_base) * (self.d_model_base / d_model))
+        # For complete_p with head_dim = d_model // n_heads: fan-in of w_out equals d_model, same as
+        # Q/K/V, so the already-adjusted std is correct; no further change needed.
+        #
+        # For complete_p_sde: the down projection is deliberately initialized off the residual width
+        # rather than its own fan-in, so it shares the Q/K/V std of init_std * sqrt(d_model /
+        # d_model_base). Again no further change needed.
 
         init_linear(self.w_out, std=std, generator=generator)
 

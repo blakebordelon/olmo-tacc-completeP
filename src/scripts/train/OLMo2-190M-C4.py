@@ -25,7 +25,8 @@ Usage:
 
 import argparse
 import math
-from typing import List
+from dataclasses import replace
+from typing import List, Optional
 
 from olmo_core.config import DType
 from olmo_core.data import (
@@ -37,7 +38,7 @@ from olmo_core.data import (
 from olmo_core.distributed.parallel import DataParallelType
 from olmo_core.nn.attention import AttentionBackendName
 from olmo_core.nn.feed_forward import FeedForwardConfig, FeedForwardType
-from olmo_core.nn.transformer import TransformerConfig
+from olmo_core.nn.transformer import JointScalingConfig, TransformerConfig
 from olmo_core.nn.transformer.init import InitMethod
 from olmo_core.optim import (
     ConstantWithWarmup,
@@ -106,6 +107,7 @@ N_HEADS  = MODEL_SIZES[MODEL_SIZE]["n_heads"]
 COMPLETE_P = True  # ← set True to use CompleteP
 D_MODEL_BASE  = MODEL_SIZES["190M"]["d_model"]   # 768  — reference width
 N_LAYERS_BASE = MODEL_SIZES["190M"]["n_layers"]  # 12   — reference depth
+N_HEADS_BASE  = MODEL_SIZES["190M"]["n_heads"]   # 12   — reference head count
 
 
 def _hidden_size_base(d_model_base: int, multiple_of: int = 256) -> int:
@@ -115,6 +117,30 @@ def _hidden_size_base(d_model_base: int, multiple_of: int = 256) -> int:
 
 
 HIDDEN_SIZE_BASE = _hidden_size_base(D_MODEL_BASE)
+# ───────────────────────────────────────────────────────────────────────────────
+
+# ── Joint SDE parametrization (--param=sde) ────────────────────────────────────
+# Relaxes the joint scaling of the residual width N, the depth L, and the block hidden widths
+# (MLP hidden size M, attention head count H).  Down projections (FFN w2, attention w_out) are
+# initialized with std ∝ sqrt(N) rather than sqrt(fan-in), which -- because Adam's update is
+# entrywise scale-invariant -- opens a gap between a block's incoherent (init) and coherent
+# (Adam) responses:
+#
+#   init:  each block writes O(sqrt(alpha / L)) into the residual stream → sums diffusively to O(sqrt(alpha))
+#   Adam:  each block's contribution moves by O(eta / L) per step        → sums coherently  to O(eta)
+#
+# Both are O(1) with a learning rate constant in N, M, H and L.  The diffusion coefficients are
+#
+#   alpha_mlp = N / (M * L)      alpha_att = N / (H * L)
+#
+# --scaling=sde   holds both alphas fixed  (N ×w, L ×d  ⇒  M ×w/d, H ×w/d)
+# --scaling=linear scales N ~ M ~ H ~ L ~ s, sending both alphas to 0 like 1/s (ODE limit)
+#
+# HEAD_DIM is held FIXED across the sweep: it is the head *count* that scales, so that the fan-in
+# of w_out is proportional to H.  Requires the pre-norm block (block_name="default"): the
+# reordered_norm block's RMSNorm sits on the branch *output* and, being 0-homogeneous, would
+# cancel the sqrt(N) init exactly.
+HEAD_DIM = 64
 # ───────────────────────────────────────────────────────────────────────────────
 
 SEQUENCE_LENGTH = 1024
@@ -138,12 +164,38 @@ VAL_DATA_PATHS = [
 def _make_parser() -> argparse.ArgumentParser:
     """Extend the standard CLI parser with sweep-friendly per-run overrides."""
     parser = get_cli_parser()
-    parser.add_argument("--d-model", type=int, default=None, help="Model width (overrides MODEL_SIZE default).")
-    parser.add_argument("--n-layers", type=int, default=None, help="Number of transformer layers (overrides MODEL_SIZE default).")
-    parser.add_argument("--n-heads", type=int, default=None, help="Number of attention heads (overrides MODEL_SIZE default).")
+    parser.add_argument("--d-model", "--d_model", type=int, default=None, help="Model width (overrides MODEL_SIZE default).")
+    parser.add_argument("--n-layers", "--n_layers", type=int, default=None, help="Number of transformer layers (overrides MODEL_SIZE default).")
+    parser.add_argument("--n-heads", "--n_heads", type=int, default=None, help="Number of attention heads (overrides MODEL_SIZE default).")
+    parser.add_argument("--head-dim", "--head_dim", type=int, default=None, help="Attention head dim. Only used with --param=sde, where it is held fixed across the sweep (default: HEAD_DIM).")
+    parser.add_argument("--hidden-size", "--hidden_size", type=int, default=None, help="FFN hidden size M. Only used with --param=sde (default: derived from the scaling recipe).")
+    parser.add_argument(
+        "--param",
+        type=str,
+        default="complete_p" if COMPLETE_P else "standard",
+        choices=["standard", "complete_p", "sde"],
+        help="Parametrization: 'standard', 'complete_p' (CompleteP, ODE depth limit), or 'sde' (joint SDE scaling with sqrt(N) down-projection init).",
+    )
+    parser.add_argument(
+        "--scaling",
+        type=str,
+        default="sde",
+        choices=["sde", "linear"],
+        help="With --param=sde: 'sde' holds alpha_mlp and alpha_att fixed; 'linear' scales N ~ M ~ H ~ L together (alphas fall like 1/mult).",
+    )
+    parser.add_argument(
+        "--block",
+        type=str,
+        default=None,
+        choices=["default", "reordered_norm"],
+        help="Transformer block type. Defaults to 'default' (pre-norm) for --param=sde and 'reordered_norm' otherwise. Use --param=complete_p --block=default as the control run that isolates the init change from the block change.",
+    )
+    parser.add_argument("--width-mult", "--width_mult", type=float, default=1.0, help="With --param=sde --scaling=sde: multiplier on d_model relative to the base model.")
+    parser.add_argument("--depth-mult", "--depth_mult", type=float, default=1.0, help="With --param=sde --scaling=sde: multiplier on n_layers relative to the base model.")
+    parser.add_argument("--linear-mult", "--linear_mult", type=float, default=1.0, help="With --param=sde --scaling=linear: multiplier on all of N, M, H, L.")
     parser.add_argument("--lr", type=float, default=None, help="Peak learning rate (overrides LR default).")
-    parser.add_argument("--total-tokens", type=float, default=None, help="Total training tokens, e.g. 1e11 (overrides TOTAL_TOKENS default).")
-    parser.add_argument("--global-batch-size", type=int, default=None, help="Global batch size in tokens (overrides GLOBAL_BATCH_SIZE default).")
+    parser.add_argument("--total-tokens", "--total_tokens", type=float, default=None, help="Total training tokens, e.g. 1e11 (overrides TOTAL_TOKENS default).")
+    parser.add_argument("--global-batch-size", "--global_batch_size", type=int, default=None, help="Global batch size in tokens (overrides GLOBAL_BATCH_SIZE default).")
     parser.add_argument(
         "--schedule",
         type=str,
@@ -153,6 +205,7 @@ def _make_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--wsd-decay-fraction",
+        "--wsd_decay_fraction",
         type=float,
         default=0.1,
         help="Fraction of total steps used for linear decay in the WSD schedule (default: 0.1).",
@@ -167,6 +220,11 @@ def _fmt_lr(lr: float) -> str:
     return s
 
 
+def _fmt_mult(x: float) -> str:
+    """Format a scaling multiplier as a short string, e.g. 2, 1.5, 0.5."""
+    return f"{x:.3g}"
+
+
 def _fmt_tokens(n: float) -> str:
     """Format a token count as a short string, e.g. 100B or 10B."""
     if n >= 1e12:
@@ -178,16 +236,55 @@ def _fmt_tokens(n: float) -> str:
 
 def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentConfig:
     # ── Resolve hyperparams (CLI args take priority over script-level constants) ──
-    d_model      = opts.d_model       or D_MODEL
-    n_layers     = opts.n_layers      or N_LAYERS
-    n_heads      = opts.n_heads       or N_HEADS
     lr           = opts.lr            or LR
     total_tokens = int(opts.total_tokens or TOTAL_TOKENS)
     batch_size   = opts.global_batch_size or GLOBAL_BATCH_SIZE
     schedule          = opts.schedule  # "cosine" | "constant" | "polynomial" | "wsd"
     wsd_decay_fraction = opts.wsd_decay_fraction
+    param             = opts.param     # "standard" | "complete_p" | "sde"
 
-    head_dim = d_model // n_heads
+    # ── Resolve model dimensions ─────────────────────────────────────────────────
+    scaling: Optional[JointScalingConfig] = None
+    hidden_size: Optional[int] = None
+
+    if param == "sde":
+        # N, M, H, L come from the scaling recipe, with HEAD_DIM held fixed.
+        base = JointScalingConfig.base(
+            d_model=D_MODEL_BASE,
+            n_layers=N_LAYERS_BASE,
+            n_heads=N_HEADS_BASE,
+            head_dim=opts.head_dim or HEAD_DIM,
+            hidden_size=HIDDEN_SIZE_BASE,
+        )
+        if opts.scaling == "sde":
+            scaling = base.scale_sde(width_mult=opts.width_mult, depth_mult=opts.depth_mult)
+        else:
+            scaling = base.scale_linear(mult=opts.linear_mult)
+
+        # Explicit dimension args override the recipe, for one-off points off the ray.
+        scaling = replace(
+            scaling,
+            d_model=opts.d_model or scaling.d_model,
+            n_layers=opts.n_layers or scaling.n_layers,
+            n_heads=opts.n_heads or scaling.n_heads,
+            hidden_size=opts.hidden_size or scaling.hidden_size,
+        )
+        scaling.check_alphas()
+
+        d_model, n_layers, n_heads = scaling.d_model, scaling.n_layers, scaling.n_heads
+        head_dim, hidden_size = scaling.head_dim, scaling.hidden_size
+    else:
+        d_model  = opts.d_model  or D_MODEL
+        n_layers = opts.n_layers or N_LAYERS
+        n_heads  = opts.n_heads  or N_HEADS
+        head_dim = d_model // n_heads
+
+    block_name = opts.block or ("default" if scaling is not None else "reordered_norm")
+    if scaling is not None and block_name != "default":
+        raise ValueError(
+            "--param=sde requires --block=default: a block that normalizes the residual branch "
+            "output cancels the sqrt(N) init on the down projections exactly."
+        )
 
     # ── Build scheduler ──────────────────────────────────────────────────────────
     if schedule == "cosine":
@@ -202,6 +299,19 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
         raise ValueError(f"Unknown schedule: {schedule!r}")
 
     # ── Auto-generate run name from hyperparams ──────────────────────────────────
+    # `family` leads the run name and doubles as the W&B group. The two rays of --param=sde share
+    # a parametrization (complete_p_sde init) and differ only in how the block hidden widths scale
+    # with N and L, which is exactly what the diffusion coefficients alpha_mlp / alpha_att see:
+    #   sdescale  holds both alphas fixed        -> diffusion survives, SDE depth limit
+    #   odescale  scales N ~ M ~ H ~ L linearly  -> alphas fall like 1/s, drift-only ODE limit
+    # ('odescale' is *not* 'completep': same ODE limit, different parametrization at finite size.)
+    if scaling is not None:
+        family = "sdescale" if opts.scaling == "sde" else "odescale"
+    elif param == "complete_p":
+        family = "completep"
+    else:
+        family = "standard"
+
     optim_tag = "skip_adamw"
     run_name = (
         f"h{n_heads}_hd{head_dim}_L{n_layers}"
@@ -209,8 +319,27 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
         f"_bs{batch_size // 1024}k"
         f"_lr{_fmt_lr(lr)}_{optim_tag}"
     )
-    if COMPLETE_P:
+    if scaling is not None:
+        # Multipliers are read back off the *final* dims rather than the CLI args, so they stay
+        # honest when an individual dim is overridden off the ray. The alphas are derivable from
+        # N/M/H/L and constant along the SDE ray by construction, so they live in the W&B config
+        # rather than eating characters in every name.
+        mult_tag = (
+            f"s{_fmt_mult(scaling.width_mult)}"
+            if opts.scaling == "linear"
+            else f"w{_fmt_mult(scaling.width_mult)}_d{_fmt_mult(scaling.depth_mult)}"
+        )
+        run_name = (
+            f"{family}_{mult_tag}"
+            f"_N{d_model}_M{hidden_size}_H{n_heads}_hd{head_dim}_L{n_layers}"
+            f"_T{_fmt_tokens(total_tokens)}"
+            f"_bs{batch_size // 1024}k"
+            f"_lr{_fmt_lr(lr)}_{optim_tag}"
+        )
+    elif param == "complete_p":
         run_name += "_completep"
+    if scaling is None and block_name != "reordered_norm":
+        run_name += f"_{block_name}"
     if schedule == "wsd":
         run_name += f"_wsd{int(wsd_decay_fraction * 100)}pct"
     elif schedule != "cosine":
@@ -227,14 +356,29 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
         n_layers=n_layers,
         n_heads=n_heads,
         vocab_size=tokenizer_config.padded_vocab_size(),
-        block_name="reordered_norm",
+        # The SDE parametrization needs the pre-norm block: reordered_norm puts an RMSNorm on the
+        # residual branch *output*, which (being 0-homogeneous) cancels the sqrt(N) init on the
+        # down projections exactly and would silently reduce the model to CompleteP.
+        block_name=block_name,
+        # Pin head_dim so the head count H scales independently of the residual width N.
+        head_dim=head_dim if scaling is not None else None,
+        feed_forward=(
+            FeedForwardConfig(hidden_size=hidden_size, bias=False, dtype=DType.float32)
+            if hidden_size is not None
+            else None
+        ),
         qk_norm=True,
         rope_theta=500_000,
         layer_norm_eps=1e-6,
         attn_backend=AttentionBackendName.flash_2,
     )
 
-    if COMPLETE_P:
+    if scaling is not None:
+        # Sets init_method=complete_p_sde, the CompleteP feed-forward, the attention/FFN/LM-head
+        # base dims (d_model_base, n_heads_base, head_dim_base, hidden_size_base), the QKV
+        # multiplier, and residual_alpha = L_base / L on both branches.
+        scaling.apply(model_config)
+    elif param == "complete_p":
         # Switch to CompleteP init (scales all weight stds by sqrt(d_model / d_model_base)).
         model_config.init_method = InitMethod.complete_p
         # Attention: store d_model_base so Attention.__init__ can set w_out_mult and
@@ -300,6 +444,46 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
         max_grad_norm=1.0,
     )
 
+    # Scalars to log as the W&B run config, so runs can be grouped/plotted by the scaling
+    # dimensions. `main()` only pushes the full experiment config into ConfigSaverCallback, not
+    # into WandBCallback, so without this the W&B run has no config at all.
+    wandb_config = {
+        "family": family,
+        "param": param,
+        "block": block_name,
+        "d_model": d_model,
+        "n_layers": n_layers,
+        "n_heads": n_heads,
+        "head_dim": head_dim,
+        "hidden_size": hidden_size if hidden_size is not None else model_config.block.feed_forward.hidden_size,  # type: ignore[union-attr]
+        "lr": lr,
+        "schedule": schedule,
+        "global_batch_size": batch_size,
+        "sequence_length": sequence_length,
+        "total_tokens": total_tokens,
+    }
+    # W&B tags/group: `family` gives a native grouping of the runs by parametrization + ray, so
+    # the two rays of --param=sde can be filtered without regex-matching run names.
+    wandb_tags = [f"param-{param}", f"block-{block_name}", family]
+    if scaling is not None:
+        wandb_tags.append(f"scaling-{opts.scaling}")
+        wandb_config.update(
+            scaling_mode=opts.scaling,
+            width_mult=scaling.width_mult,
+            depth_mult=scaling.depth_mult,
+            hidden_mult=scaling.hidden_mult,
+            head_mult=scaling.head_mult,
+            alpha_mlp=scaling.alpha_mlp,
+            alpha_att=scaling.alpha_att,
+            alpha_mlp_base=scaling.alpha_mlp_base,
+            alpha_att_base=scaling.alpha_att_base,
+            residual_alpha=scaling.residual_alpha,
+            d_model_base=scaling.d_model_base,
+            n_layers_base=scaling.n_layers_base,
+            n_heads_base=scaling.n_heads_base,
+            hidden_size_base=scaling.hidden_size_base,
+        )
+
     trainer_config = (
         TrainerConfig(
             save_folder=save_folder,
@@ -335,6 +519,9 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
                 entity="blake_bordelon",
                 # Set the wandb project where this run will be logged.
                 project="olmo_simple",
+                group=family,
+                tags=wandb_tags,
+                config=wandb_config,
             ),
         )
         .with_callback(
