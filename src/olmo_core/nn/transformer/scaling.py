@@ -10,7 +10,8 @@ The parametrization implemented here (see
     h_next = h + (1 / (L * M)) W_down phi(h_up),  W_down[i,j] ~ O(sqrt(N))
 
 where ``N = d_model``, ``L = n_layers``, and ``M`` is the hidden width of the block --
-``hidden_size`` for the MLP and ``n_heads`` for attention (at fixed ``head_dim``).
+``hidden_size`` for the MLP and ``n_heads * head_dim`` for attention (i.e. the fan-in of
+``w_out``; at fixed ``head_dim`` it is the head *count* that scales).
 
 Because Adam's update is entrywise scale-invariant, the init std and the learning rate are
 independent knobs, and the ``sqrt(N)`` init std on the *down* projection buys a gap between the
@@ -26,8 +27,8 @@ residual stream therefore has a joint SDE limit whose diffusion coefficients are
 
 .. code::
 
-    alpha_mlp = N / (M * L) = d_model / (hidden_size * n_layers)
-    alpha_att = N / (H * L) = d_model / (n_heads   * n_layers)
+    alpha_mlp = N / (M * L)          = d_model / (hidden_size * n_layers)
+    alpha_att = N / (H * d_head * L) = d_model / (n_heads * head_dim * n_layers)
 
 Holding both alphas fixed while growing ``N``, ``M``, ``H`` and ``L`` gives the SDE ray
 (:meth:`JointScalingConfig.scale_sde`). Any other joint scaling is also stable -- the drift is
@@ -258,8 +259,8 @@ class JointScalingConfig(Config):
 
     @property
     def alpha_att(self) -> float:
-        """The attention diffusion coefficient ``d_model / (n_heads * n_layers)``."""
-        return self.d_model / (self.n_heads * self.n_layers)
+        """The attention diffusion coefficient ``d_model / (n_heads * head_dim * n_layers)``."""
+        return self.d_model / (self.n_heads * self.head_dim * self.n_layers)
 
     @property
     def alpha_mlp_base(self) -> float:
@@ -269,7 +270,7 @@ class JointScalingConfig(Config):
     @property
     def alpha_att_base(self) -> float:
         """:attr:`alpha_att` of the base model."""
-        return self.d_model_base / (self.n_heads_base * self.n_layers_base)
+        return self.d_model_base / (self.n_heads_base * self.head_dim * self.n_layers_base)
 
     @property
     def residual_alpha(self) -> float:

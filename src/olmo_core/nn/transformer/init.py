@@ -120,7 +120,7 @@ class InitMethod(StrEnum):
     diffusion coefficients
 
     - ``alpha_mlp = d_model / (hidden_size * n_layers)``
-    - ``alpha_att = d_model / (n_heads * n_layers)``
+    - ``alpha_att = d_model / (n_heads * head_dim * n_layers)``
 
     .. important::
         This only has any effect on a block whose residual branch output is *not* normalized,

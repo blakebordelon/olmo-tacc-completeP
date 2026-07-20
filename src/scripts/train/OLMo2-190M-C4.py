@@ -131,7 +131,7 @@ HIDDEN_SIZE_BASE = _hidden_size_base(D_MODEL_BASE)
 #
 # Both are O(1) with a learning rate constant in N, M, H and L.  The diffusion coefficients are
 #
-#   alpha_mlp = N / (M * L)      alpha_att = N / (H * L)
+#   alpha_mlp = N / (M * L)      alpha_att = N / (H * d_head * L)
 #
 # --scaling=sde   holds both alphas fixed  (N ×w, L ×d  ⇒  M ×w/d, H ×w/d)
 # --scaling=linear scales N ~ M ~ H ~ L ~ s, sending both alphas to 0 like 1/s (ODE limit)
