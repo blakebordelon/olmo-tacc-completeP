@@ -24,6 +24,7 @@ Usage:
 """
 
 import argparse
+import logging
 import math
 from dataclasses import replace
 from typing import List, Optional
@@ -62,6 +63,35 @@ from olmo_core.train.train_module import (
     TransformerDataParallelWrappingStrategy,
     TransformerTrainModuleConfig,
 )
+
+log = logging.getLogger(__name__)
+
+
+def _log_attn_backend(model_config: TransformerConfig):
+    """
+    Log which attention backend the model is configured to use, and whether flash-attn is
+    actually importable on this node. Purely diagnostic: throughput silently collapses if a
+    run falls back to the unfused SDPA math path, so we want it stated plainly in the logs.
+
+    :param model_config: The (already built) transformer config to inspect.
+    """
+    from olmo_core.nn.attention.flash_attn_api import has_flash_attn_2
+
+    backend = getattr(model_config.block.attention, "backend", None)
+    available = has_flash_attn_2()
+    try:
+        import flash_attn
+
+        version = flash_attn.__version__
+    except ImportError:
+        version = "not installed"
+
+    log.info(f"ATTENTION BACKEND: requested={backend}, flash_attn_2_available={available} (flash-attn {version})")
+    if not available:
+        log.warning(
+            "flash-attn is NOT available on this node. If the backend above is a flash_* variant "
+            "the run will fail at model build; if it is 'torch' you are on the slow SDPA math path."
+        )
 
 # ── Model size selection ────────────────────────────────────────────────────────
 # Change MODEL_SIZE to quickly switch between preset architectures, or set
@@ -144,7 +174,7 @@ HEAD_DIM = 64
 # ───────────────────────────────────────────────────────────────────────────────
 
 SEQUENCE_LENGTH = 1024
-GLOBAL_BATCH_SIZE = 576 * SEQUENCE_LENGTH  # ~524K tokens/step (divisible by rank_microbatch=64*1024 with any DP world size)
+GLOBAL_BATCH_SIZE = 576 * SEQUENCE_LENGTH  # ~524K tokens/step (divisible by rank_microbatch=32*1024 with any DP world size)
 LR = 1e-3
 TOTAL_TOKENS = int(4e9)  # 4B tokens
 
@@ -538,6 +568,8 @@ def build_config(opts: argparse.Namespace, overrides: List[str]) -> ExperimentCo
             ),
         )
     )
+
+    _log_attn_backend(model_config)
 
     return ExperimentConfig(
         model=model_config,
